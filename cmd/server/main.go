@@ -132,23 +132,26 @@ func runCore(stopCh <-chan struct{}, cfg *config.ServerConfig) {
 				log.Println("Read error:", err)
 				continue
 			}
-			if data != nil {
-				text := string(data)
-
-				var obj any
-				if err := json.Unmarshal(data, &obj); err == nil {
-					log.Println("[SHM] JSON:", obj)
-				} else {
-					log.Println("[SHM] RAW:", text)
-				}
-
-				hub.Broadcast(text)
+			if data == nil {
+				// timeout / データなし → 何もしない
+				continue
 			}
+
+			text := string(data)
+
+			var obj any
+			if err := json.Unmarshal(data, &obj); err == nil {
+				log.Println("[SHM] JSON:", obj)
+			} else {
+				log.Println("[SHM] RAW:", text)
+			}
+
+			hub.Broadcast(text)
 		}
 	}
 }
 
-// ======== EventLog Writer ========
+// ======== EventLog Writer / Windows サービス部分はそのまま ========
 
 type EventLogWriter struct {
 	elog *eventlog.Log
@@ -162,8 +165,6 @@ func (w *EventLogWriter) Write(p []byte) (n int, err error) {
 	}
 	return len(p), nil
 }
-
-// ======== Windows サービス実装 ========
 
 type myService struct {
 	cfg *config.ServerConfig
@@ -191,10 +192,7 @@ func (m *myService) Execute(args []string, r <-chan svc.ChangeRequest, s chan<- 
 	return false, 0
 }
 
-// ======== エントリポイント ========
-
 func main() {
-	// 設定ファイル読み込み（サービス/コンソール共通）
 	cfg, err := config.Load("config.json")
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -218,7 +216,6 @@ func main() {
 		return
 	}
 
-	// サービスモード
 	elog, err := eventlog.Open(serviceName)
 	if err == nil {
 		log.SetOutput(&EventLogWriter{elog})

@@ -6,6 +6,10 @@ package ipc
 import (
 	"encoding/binary"
 	"errors"
+	"log"
+	"runtime"
+	"sync"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -21,6 +25,7 @@ type SharedMemory struct {
 	view   uintptr
 	size   int
 	buf    []byte
+	mu     sync.Mutex
 }
 
 func OpenSharedMemory(cfg *config.ServerConfig, create bool) (*SharedMemory, error) {
@@ -58,52 +63,150 @@ func OpenSharedMemory(cfg *config.ServerConfig, create bool) (*SharedMemory, err
 	}, nil
 }
 
-func (m *SharedMemory) Read(timeoutMs int) ([]byte, error) {
-	s, err := windows.WaitForSingleObject(m.hMutex, uint32(timeoutMs))
-	if err != nil {
-		return nil, err
+// TryRead
+//
+//	ok=false, err=nil → timeout（正常系）
+//	ok=true,  err=nil → 読み取り成功
+//	err!=nil          → システムエラー
+func (m *SharedMemory) TryRead(timeoutMs int) ([]byte, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	id := time.Now().UnixNano()
+
+	log.Printf("[SHM] Read(%d) wait start", id)
+	start := time.Now()
+
+	// WaitForSingleObject と ReleaseMutex を同一 OS スレッドで行う
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	s, werr := windows.WaitForSingleObject(m.hMutex, uint32(timeoutMs))
+	elapsed := time.Since(start)
+
+	if werr != nil {
+		log.Printf("[SHM] Read(%d) WaitForSingleObject error: %v (elapsed=%v)", id, werr, elapsed)
+		return nil, false, werr
 	}
-	if s != windows.WAIT_OBJECT_0 && s != windows.WAIT_ABANDONED {
-		// TIMEOUT など
-		return nil, errors.New("mutex wait timeout or failed")
+
+	switch s {
+	case windows.WAIT_OBJECT_0, windows.WAIT_ABANDONED:
+		log.Printf("[SHM] Read(%d) wait ok (result=%#x, elapsed=%v)", id, s, elapsed)
+
+	case uint32(windows.WAIT_TIMEOUT):
+		log.Printf("[SHM] Read(%d) timeout (elapsed=%v)", id, elapsed)
+		return nil, false, nil
+
+	default:
+		log.Printf("[SHM] Read(%d) unexpected wait result=%#x", id, s)
+		return nil, false, errors.New("mutex wait failed")
 	}
-	defer windows.ReleaseMutex(m.hMutex)
+
+	defer func() {
+		if err := windows.ReleaseMutex(m.hMutex); err != nil {
+			log.Printf("[SHM] Read(%d) ReleaseMutex error: %v", id, err)
+		} else {
+			log.Printf("[SHM] Read(%d) released", id)
+		}
+	}()
 
 	if m.size < HeaderSize {
-		return nil, errors.New("invalid shared memory size")
+		return nil, false, errors.New("invalid shared memory size")
 	}
 
 	payloadSize := binary.LittleEndian.Uint32(m.buf[0:4])
 	if int(payloadSize) > m.size-HeaderSize {
-		return nil, errors.New("payload too large")
+		return nil, false, errors.New("payload too large")
+	}
+
+	if payloadSize == 0 {
+		return nil, true, nil
 	}
 
 	data := make([]byte, payloadSize)
 	copy(data, m.buf[4:4+payloadSize])
+	return data, true, nil
+}
+
+func (m *SharedMemory) Read(timeoutMs int) ([]byte, error) {
+	data, ok, err := m.TryRead(timeoutMs)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
 	return data, nil
 }
 
-func (m *SharedMemory) Write(data []byte, timeoutMs int) error {
+// TryWrite
+//
+//	ok=false, err=nil → timeout（正常系）
+//	ok=true,  err=nil → 書き込み成功
+//	err!=nil          → システムエラー
+func (m *SharedMemory) TryWrite(data []byte, timeoutMs int) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if len(data)+HeaderSize > m.size {
-		return errors.New("data too large")
+		return false, errors.New("data too large")
 	}
 
-	s, err := windows.WaitForSingleObject(m.hMutex, uint32(timeoutMs))
-	if err != nil {
-		return err
+	id := time.Now().UnixNano()
+
+	log.Printf("[SHM] Write(%d) wait start", id)
+	start := time.Now()
+
+	// WaitForSingleObject と ReleaseMutex を同一 OS スレッドで行う
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	s, werr := windows.WaitForSingleObject(m.hMutex, uint32(timeoutMs))
+	elapsed := time.Since(start)
+
+	if werr != nil {
+		log.Printf("[SHM] Write(%d) WaitForSingleObject error: %v (elapsed=%v)", id, werr, elapsed)
+		return false, werr
 	}
-	if s != windows.WAIT_OBJECT_0 && s != windows.WAIT_ABANDONED {
-		return errors.New("mutex wait timeout or failed")
+
+	switch s {
+	case windows.WAIT_OBJECT_0, windows.WAIT_ABANDONED:
+		log.Printf("[SHM] Write(%d) wait ok (result=%#x, elapsed=%v)", id, s, elapsed)
+
+	case uint32(windows.WAIT_TIMEOUT):
+		log.Printf("[SHM] Write(%d) timeout (elapsed=%v)", id, elapsed)
+		return false, nil
+
+	default:
+		log.Printf("[SHM] Write(%d) unexpected wait result=%#x", id, s)
+		return false, errors.New("mutex wait failed")
 	}
-	defer windows.ReleaseMutex(m.hMutex)
+
+	defer func() {
+		if err := windows.ReleaseMutex(m.hMutex); err != nil {
+			log.Printf("[SHM] Write(%d) ReleaseMutex error: %v", id, err)
+		} else {
+			log.Printf("[SHM] Write(%d) released", id)
+		}
+	}()
 
 	binary.LittleEndian.PutUint32(m.buf[0:4], uint32(len(data)))
 	copy(m.buf[4:], data)
+	return true, nil
+}
+
+func (m *SharedMemory) Write(data []byte, timeoutMs int) error {
+	ok, err := m.TryWrite(data, timeoutMs)
+	if err != nil {
+		return err
+	}
+	// timeout は正常系なので err=nil のまま
+	_ = ok
 	return nil
 }
 
 func (m *SharedMemory) Close() {
-	unmapViewOfFile(m.view)
-	closeHandle(m.hMap)
-	closeHandle(m.hMutex)
+	_ = unmapViewOfFile(m.view)
+	_ = closeHandle(m.hMap)
+	_ = closeHandle(m.hMutex)
 }

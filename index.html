@@ -76,7 +76,7 @@
 
         function appendJSON(obj) {
             const pretty = JSON.stringify(obj, null, 2);
-            log.innerHTML = syntaxHighlight(pretty) + "\n\n" + log.innerHTML;
+            log.innerHTML = syntaxHighlight(pretty);
         }
 
         const ws = new WebSocket("ws://localhost:8766/ws");
@@ -87,7 +87,7 @@
                 const obj = JSON.parse(ev.data);
                 appendJSON(obj);
             } catch {
-                log.innerHTML = ev.data + "\n\n" + log.innerHTML;
+                log.innerHTML = ev.data;
             }
         };
         ws.onclose = () => console.log("Closed");

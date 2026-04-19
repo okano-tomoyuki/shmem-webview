@@ -4,46 +4,57 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
-	"time"
+    "encoding/json"
+    "log"
+    "os"
+    "time"
 
-	"shmem-webview/internal/config"
-	"shmem-webview/internal/ipc"
+    "shmem-webview/internal/config"
+    "shmem-webview/internal/ipc"
 )
 
 func main() {
-	fmt.Println("Go client starting...")
+    log.SetOutput(os.Stdout)
+    log.Println("Go client starting...")
 
-	// 設定ファイル読み込み
-	cfg, err := config.Load("config.json")
-	if err != nil {
-		panic(err)
-	}
+    cfg, err := config.Load("config.json")
+    if err != nil {
+        log.Fatalf("Failed to load config: %v", err)
+    }
 
-	// 共有メモリ（client は create=false）
-	shm, err := ipc.OpenSharedMemory(cfg, false)
-	if err != nil {
-		panic(err)
-	}
-	defer shm.Close()
+    shm, err := ipc.OpenSharedMemory(cfg, false) // client は create=false
+    if err != nil {
+        log.Fatalf("OpenSharedMemory failed: %v", err)
+    }
+    defer shm.Close()
 
-	seq := 0
+    seq := 0
+    ticker := time.NewTicker(1 * time.Second)
+    defer ticker.Stop()
 
-	for {
-		seq++
-		msg := map[string]any{
-			"seq":  seq,
-			"time": time.Now().Format(time.RFC3339),
-		}
-		payload, _ := json.Marshal(msg)
+    for range ticker.C {
+        seq++
+        msg := map[string]any{
+            "seq":  seq,
+            "time": time.Now().Format(time.RFC3339),
+        }
+        data, err := json.Marshal(msg)
+        if err != nil {
+            log.Println("JSON marshal error:", err)
+            continue
+        }
 
-		if err := shm.Write(payload, cfg.PollTimeoutMs); err != nil {
-			fmt.Println("Write error:", err)
-		} else {
-			fmt.Println("Wrote:", string(payload))
-		}
+        ok, err := shm.TryWrite(data, cfg.PollTimeoutMs)
+        if err != nil {
+            log.Println("Write error:", err)
+            continue
+        }
+        if !ok {
+            // mutex が取れなかった（timeout）→ 今回はスキップ
+            log.Println("Write skipped: mutex busy (timeout)")
+            continue
+        }
 
-		time.Sleep(1 * time.Second)
-	}
+        log.Printf("Wrote: %s", string(data))
+    }
 }

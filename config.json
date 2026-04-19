@@ -1,7 +1,7 @@
 {
-    "shmem_name": "CPP_DEBUG_SHMEM",
+    "shmem_name": "DEBUG_SHMEM_AAA",
     "shmem_size": 65536,
-    "mutex_name": "CPP_DEBUG_MUTEX",
+    "mutex_name": "DEBUG_MUTEX_AAA",
     "shmem_poll_ms": 500,
     "poll_timeout_ms" : 50,
     "ws_port": 8766
